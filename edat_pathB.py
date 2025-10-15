@@ -1,178 +1,197 @@
-import os, time, csv, math, sys
+# edat_pathB.py — EDAT Regime Engine (Path B) [minute-native, robust tail, fast fit]
+# pip install numpy scipy hmmlearn
+
+import time, csv, sys
 import numpy as np
-import pandas as pd
 from collections import deque
 from pathlib import Path
 from hmmlearn.hmm import GaussianHMM
 
-DATA = Path(r"C:\SierraChart\Data\EDAT\MNQ_1s.csv")         # input from Sierra (1s or 1m ok)
+# --- PATHS (match Sierra's writer exactly) ---
+DATA = Path(r"C:\SierraChart\Data\EDAT\MNQ_1m.csv")   # <- use MNQ_1s.csv if you write seconds
 OUT  = Path(r"C:\SierraChart\Data\EDAT\edat_regime_MNQ.csv")
-MODEL_DIR = Path(r"C:\SierraChart\Data\EDAT\models"); MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-# ---------------- utilities ----------------
-
+# ---------- utils ----------
 def rolling_entropy(x, bins=20):
     if len(x) < 2: return 0.0
     hist, _ = np.histogram(x, bins=bins)
-    p = hist / np.maximum(1, hist.sum())
-    p = p[p>0]
-    return float(-(p*np.log(p)).sum())
+    s = hist.sum()
+    if s <= 0: return 0.0
+    p = hist / s
+    p = p[p > 0]
+    return float(-(p * np.log(p)).sum())
 
 class Roller:
-    def __init__(self, n): self.n=n; self.q=deque(maxlen=n)
+    def __init__(self, n): self.q=deque(maxlen=n)
     def add(self,x): self.q.append(float(x))
     def mean(self): return float(np.mean(self.q)) if self.q else 0.0
     def std(self):  return float(np.std(self.q))  if self.q else 0.0
     def sum(self):  return float(np.sum(self.q))  if self.q else 0.0
+    def __len__(self): return len(self.q)
 
-# ---------------- ingest ----------------
+def safe_append(path: Path, row, retries=12, wait=0.25):
+    for _ in range(retries):
+        try:
+            with path.open('a', newline='') as f:
+                csv.writer(f).writerow(row)
+            return True
+        except PermissionError:
+            time.sleep(wait)
+    return False
 
+# ---------- robust tailer (NO csv.reader on the file) ----------
 def tail_csv(path: Path, sleep=0.25):
+    print(f"[EDAT] Tailing: {path}")
+    while not path.exists():
+        print("[EDAT] Waiting for input file…"); time.sleep(sleep)
     with path.open('r', newline='') as f:
-        rdr = csv.reader(f)
-        header = next(rdr)  # assume exists
-        pos = f.tell()
+        # read header (or first line) once
+        header = None
+        while header is None:
+            first = f.readline()
+            if not first:
+                time.sleep(sleep); f.seek(0); continue
+            header = [h.strip().lower() for h in first.strip().split(',')]
+            print(f"[EDAT] Header/First: {header}")
+
+        bars = 0
         while True:
+            pos = f.tell()
             line = f.readline()
             if not line:
-                time.sleep(sleep)
-                f.seek(pos)
+                time.sleep(sleep); f.seek(pos); continue
+            parts = [p.strip() for p in line.strip().split(',')]
+            if len(parts) < 6:  # need at least ts, O,H,L,C,V
                 continue
-            pos = f.tell()
-            row = next(csv.reader([line]))
-            # Expect: DateTime, Open, High, Low, Close, Volume, ...
             try:
-                ts = row[0]
-                o,h,l,c,v = map(float, row[1:6])
+                ts = parts[0]
+                o,h,l,c,v = map(float, parts[1:6])
             except Exception:
                 continue
+            bars += 1
+            if bars % 10 == 0:
+                print(f"[EDAT] Bar {bars} @ {ts} c={c} v={v}")
             yield ts,o,h,l,c,v
 
-# ---------------- model ----------------
-
-def build_features(stream, is_minute=True):
-    """Yield dict per bar with features and prices."""
-    # windows in BARS (minute‑native)
-    w_dp  = 60
-    w_phi = 20
-    w_rv  = 120
-    w_hl  = 60
-    
-    dpw  = Roller(w_dp)
-    phiw = Roller(w_phi)
-    r2w  = Roller(w_rv)  # dp^2
-    hlw  = Roller(w_hl)
-    pw_prev = None
-
-    hi = lo = None
-
-    for ts,o,h,l,c,v in stream:
-        if pw_prev is not None:
-            dp = c - pw_prev
-            dpw.add(dp)
-            r2w.add(dp*dp)
-            phiw.add(abs(dp)*v)        # φ contribution
-        pw_prev = c
-
-        # HL tracking for entropy proxy
+# ---------- features (minute-native windows in BARS) ----------
+def build_features_from_rows(rows):
+    w_dp, w_phi, w_rv, w_hl = 60, 20, 120, 60
+    dpw, phiw, r2w, hlw = Roller(w_dp), Roller(w_phi), Roller(w_rv), Roller(w_hl)
+    prev = None; hi = lo = None
+    for ts,o,h,l,c,v in rows:
+        if prev is not None:
+            dp = c - prev
+            dpw.add(dp); r2w.add(dp*dp); phiw.add(abs(dp)*v)
+        prev = c
         hi = c if hi is None else max(hi, h)
         lo = c if lo is None else min(lo, l)
         hlw.add(hi - lo)
 
-        # metrics
         eps  = dpw.std()
-        rv   = r2w.sum()                 # realized variance sum
-        hlm  = hlw.mean()                # HL mean
-        zeta = ( (rv + hlm) - (r2w.mean()+hlm) ) / (r2w.std() + 1e-9)  # coarse zscore
+        rv   = r2w.sum()
+        rv_s = (np.std(r2w.q) if len(r2w) else 1e-6)
+        hlm  = hlw.mean()
+        zeta = ((rv + hlm) - (np.mean(r2w.q) if len(r2w) else 0.0 + hlm)) / (rv_s + 1e-9)
         phi  = phiw.sum()
-        eta  = 1.0 / (1.0 + (dpw.std() or 1e-9))
-        # ω minute proxy = second difference
-        omega = 0.0
-        if len(dpw.q) > 2:
-            omega = dpw.q[-1] - dpw.q[-2]
-        # S entropy on recent closes
+        eta  = 1.0 / (1.0 + (eps or 1e-9))
+        omega = (dpw.q[-1] - dpw.q[-2]) if len(dpw) > 2 else 0.0
         S = rolling_entropy(list(dpw.q), bins=20)
 
-        yield {
-            'ts': ts, 'o':o,'h':h,'l':l,'c':c,'v':v,
-            'eps':eps, 'zeta':zeta, 'phi':phi, 'eta':eta, 'omega':omega, 'S':S
-        }
+        yield {'ts':ts,'eps':eps,'zeta':zeta,'phi':phi,'eta':eta,'omega':omega,'S':S}
 
-# ---------------- regime engine ----------------
+def preload_rows(path: Path, N=2000):
+    if not path.exists(): return []
+    lines = path.read_text().strip().splitlines()
+    out=[]
+    for line in lines[-N:]:
+        parts = [p.strip() for p in line.split(',')]
+        if len(parts) < 6: continue
+        try:
+            ts = parts[0]; o,h,l,c,v = map(float, parts[1:6])
+            out.append((ts,o,h,l,c,v))
+        except Exception:
+            continue
+    return out
 
+# ---------- main loop ----------
 def run():
     OUT.parent.mkdir(parents=True, exist_ok=True)
     if not OUT.exists():
         with OUT.open('w', newline='') as f:
-            csv.writer(f).writerow(
-                "ts,state_id,state_name,p0,p1,p2,p3,tau,eps,zeta,phi,omega,eta,S".split(',')
-            )
+            csv.writer(f).writerow("ts,state_id,state_name,p0,p1,p2,p3,tau,eps,zeta,phi,omega,eta,S".split(','))
+        print(f"[EDAT] Created {OUT}")
 
-    # HMM config
     n_states = 4
-    min_train = 600   # bars required before first fit
-    refit_every = 60  # refit frequency (bars)
+    min_train = 120     # faster first fit
+    refit_every = 30
 
-    hmm = None
-    buf = []
-    tau = 0
-    last_state = None
+    hmm = None; scale = None; buf=[]; tau=0; last_state=None; bar_i=0
 
-    # stream
-    bar_i = 0
-    for rec in build_features(tail_csv(DATA)):
+    # Bootstrap from existing file so we can fit immediately
+    boot = preload_rows(DATA, N=2000)
+    if boot:
+        feats = list(build_features_from_rows(boot))
+        for r in feats:
+            buf.append([r['eps'], r['zeta'], r['phi'], r['eta'], r['omega'], r['S']])
+        if len(buf) >= min_train:
+            X = np.array(buf[-2000:])
+            X_tr = X.copy(); X_tr[:,2] = np.log1p(np.maximum(0.0, X[:,2]))  # log φ
+            stds = X_tr.std(axis=0) + 1e-6; means = X_tr.mean(axis=0)
+            X_tr = (X_tr - means) / stds
+            hmm = GaussianHMM(n_components=n_states, covariance_type='full', n_iter=200, random_state=7)
+            hmm.fit(X_tr)
+            scale = (means, stds)
+            print(f"[EDAT] HMM prefit on {len(X_tr)} bars")
+
+    # Live tail
+    for rec in build_features_from_rows(tail_csv(DATA)):
         bar_i += 1
         buf.append([rec['eps'], rec['zeta'], rec['phi'], rec['eta'], rec['omega'], rec['S']])
 
         # fit/refit
         if (hmm is None and len(buf) >= min_train) or (hmm is not None and bar_i % refit_every == 0):
-            X = np.array(buf[-2000:])  # cap window
-            # log-transform skewed features
-            X_tr = X.copy()
-            X_tr[:,2] = np.log1p(np.maximum(0.0, X[:,2]))  # phi
-            # scale roughly by standard deviation to help HMM
-            stds = X_tr.std(axis=0) + 1e-6
-            X_tr = (X_tr - X_tr.mean(axis=0)) / stds
+            X = np.array(buf[-2000:])
+            X_tr = X.copy(); X_tr[:,2] = np.log1p(np.maximum(0.0, X[:,2]))
+            stds = X_tr.std(axis=0) + 1e-6; means = X_tr.mean(axis=0)
+            X_tr = (X_tr - means) / stds
             hmm = GaussianHMM(n_components=n_states, covariance_type='full', n_iter=200, random_state=7)
             hmm.fit(X_tr)
-            scale = (X_tr.mean(axis=0), stds)
-        # predict
-        if hmm is not None:
+            scale = (means, stds)
+            print(f"[EDAT] HMM fitted on {len(X_tr)} bars")
+
+        # predict (or provisional pre-HMM)
+        if hmm is not None and scale is not None:
             x = np.array([[rec['eps'], rec['zeta'], rec['phi'], rec['eta'], rec['omega'], rec['S']]])
             x[:,2] = np.log1p(np.maximum(0.0, x[:,2]))
             x = (x - scale[0]) / scale[1]
-            # state probabilities via score_samples
-            logprob, post = hmm.score_samples(x)
+            _, post = hmm.score_samples(x)
             p = post[0]
             state = int(np.argmax(p))
         else:
-            p = np.array([0.25,0.25,0.25,0.25])
-            state = 0
+            z, e = rec['zeta'], rec['eta']
+            if z > 1.5 and e < 0.6: state = 2   # Trend (Up placeholder)
+            elif z < 0.2 and e > 0.8: state = 0 # Range
+            else: state = 1                      # Transitional
+            p = np.array([0.0,0.0,0.0,0.0]); p[state] = 1.0
 
-        # τ run-length
         tau = tau + 1 if state == last_state else 1
         last_state = state
+        names = {0:'Range',1:'Trans',2:'TrendUp',3:'TrendDn'}
 
-        # name mapping (editable)
-        names = {
-            0: 'Range',
-            1: 'Trans',
-            2: 'TrendUp',
-            3: 'TrendDn'
-        }
-        # heuristic polarity: use omega/dp sign to split 2/3 later if desired
-
-        # write row
-        with OUT.open('a', newline='') as f:
-            wr = csv.writer(f)
-            wr.writerow([
-                rec['ts'], state, names.get(state, f'S{state}'),
-                f"{p[0]:.4f}", f"{p[1]:.4f}", f"{p[2]:.4f}", f"{p[3]:.4f}",
-                tau,
-                f"{rec['eps']:.6f}", f"{rec['zeta']:.6f}", f"{rec['phi']:.3f}", f"{rec['omega']:.6f}", f"{rec['eta']:.6f}", f"{rec['S']:.6f}"
-            ])
+        row = [
+            rec['ts'], state, names.get(state, f'S{state}'),
+            f"{p[0]:.4f}", f"{p[1]:.4f}", f"{p[2]:.4f}", f"{p[3]:.4f}",
+            tau,
+            f"{rec['eps']:.6f}", f"{rec['zeta']:.6f}", f"{rec['phi']:.3f}",
+            f"{rec['omega']:.6f}", f"{rec['eta']:.6f}", f"{rec['S']:.6f}"
+        ]
+        ok = safe_append(OUT, row)
+        if not ok:
+            print("[EDAT] WARN: output locked (Excel?). Will retry.")
+        elif bar_i % 10 == 0:
+            print(f"[EDAT] Wrote bar {bar_i}: state={state} tau={tau}")
 
 if __name__ == '__main__':
     if not DATA.exists():
-        sys.exit(f"Input file not found: {DATA}. Enable 'Write Bar And Study Data To File' on your chart.")
+        sys.exit(f"[EDAT] Input not found: {DATA}")
     run()
